@@ -6,6 +6,7 @@
 #include <thread>
 #include <vector>
 #include <set>
+#include <queue>
 #include <mutex>
 #include <unordered_map>
 #include <nlohmann/json.hpp>
@@ -24,11 +25,10 @@ class SignalingServer;
 // 2. 定义 SignalingServer 类
 class SignalingServer : public std::enable_shared_from_this<SignalingServer> {
 public:
-    SignalingServer(net::io_context& ioc, short port)
-        : _ioc(ioc), _acceptor(ioc, tcp::endpoint(tcp::v4(), port)) {}
+    SignalingServer(net::io_context& ioc, short port);
 
-    void start() { start_accept(); }
-    void stop() { _ioc.stop(); }
+    void start();
+    void stop();
     void start_accept();
 
     void register_user(const std::string& id, std::shared_ptr<Session> session);
@@ -40,7 +40,7 @@ public:
     void join_room(const std::string& room_id, std::shared_ptr<Session> session);
     void leave_room(const std::string& room_id, std::shared_ptr<Session> session);
 
-    net::io_context& get_io_context() { return _ioc; }
+    net::io_context& get_io_context();
 
 private:
     net::io_context& _ioc;
@@ -53,41 +53,27 @@ private:
 // 3. 定义 Session 类
 class Session : public std::enable_shared_from_this<Session> {
 public:
-    Session(tcp::socket socket, std::shared_ptr<SignalingServer> server)
-        : _ws(std::move(socket)), _server(server) {}
+    Session(tcp::socket socket, std::shared_ptr<SignalingServer> server);
 
-    void start() {
-        _ws.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
-        _ws.async_accept(beast::bind_front_handler(&Session::on_accept, shared_from_this()));
-    }
+    void start();
 
-    void send_json(const nlohmann::json& msg) {
-        auto msg_str = std::make_shared<std::string>(msg.dump());
-        net::post(_ws.get_executor(), [self = shared_from_this(), msg_str]() {
-            self->_ws.async_write(net::buffer(*msg_str), 
-                [self, msg_str](beast::error_code ec, std::size_t) {
-                    if (ec) std::cerr << "Write error: " << ec.message() << std::endl;
-                });
-        });
-    }
+    void send_json(const nlohmann::json& msg);
 
-    std::string get_session_id() const { return _session_id; }
+    std::string get_session_id() const;
 
-    void set_current_room(const std::string& room_id) { _current_room = room_id; }
-    std::string get_current_room() const { return _current_room; }
+    void set_current_room(const std::string& room_id);
+    std::string get_current_room() const;
 
 private:
-    void on_accept(beast::error_code ec) {
-        if (ec) return;
-        do_read();
-    }
+    void on_accept(beast::error_code ec);
 
-    void do_read() {
-        _ws.async_read(_buffer, beast::bind_front_handler(&Session::on_read, shared_from_this()));
-    }
-
+    void do_read();
     void on_read(beast::error_code ec, std::size_t bytes_transferred);
     void handle_read(const nlohmann::json& data);
+    
+    void queue_write(std::string msg);
+    void do_write();
+    
     void cleanup();
 
     websocket::stream<beast::tcp_stream> _ws;
@@ -95,9 +81,27 @@ private:
     std::shared_ptr<SignalingServer> _server;
     std::string _session_id;
     std::string _current_room;
+    std::queue<std::string> _write_queue;
 };
 
 // --- 4. 定义成员函数实现 ---
+
+
+// --- SignalingServer 类实现 ---
+SignalingServer::SignalingServer(net::io_context& ioc, short port)
+    : _ioc(ioc), _acceptor(ioc, tcp::endpoint(tcp::v4(), port)) {}
+
+void SignalingServer::start() {
+    start_accept();
+}
+
+void SignalingServer::stop() {
+    _ioc.stop();
+}
+
+net::io_context& SignalingServer::get_io_context() {
+    return _ioc;
+}
 
 void SignalingServer::start_accept() {
     _acceptor.async_accept(net::make_strand(_ioc), 
@@ -195,6 +199,68 @@ void SignalingServer::leave_room(const std::string& room_id, std::shared_ptr<Ses
     }
 }
 
+// --- Session 类实现 ---
+Session::Session(tcp::socket socket, std::shared_ptr<SignalingServer> server)
+    : _ws(std::move(socket)), _server(server) {}
+
+void Session::start() {
+    _ws.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
+    _ws.async_accept(beast::bind_front_handler(&Session::on_accept, shared_from_this()));
+}
+
+void Session::send_json(const nlohmann::json& msg) {
+    std::string msg_str = msg.dump();
+    net::post(_ws.get_executor(), [self = shared_from_this(), msg_str]() {
+        self->queue_write(std::move(msg_str));
+    });
+}
+
+std::string Session::get_session_id() const {
+    return _session_id;
+}
+
+void Session::set_current_room(const std::string& room_id) {
+    _current_room = room_id;
+}
+
+std::string Session::get_current_room() const {
+    return _current_room;
+}
+
+void Session::on_accept(beast::error_code ec) {
+    if (ec) return;
+    do_read();
+}
+
+void Session::do_read() {
+    _ws.async_read(_buffer, beast::bind_front_handler(&Session::on_read, shared_from_this()));
+}
+
+void Session::queue_write(std::string msg) {
+    bool write_in_progress = !_write_queue.empty();
+    _write_queue.push(std::move(msg));
+    if (!write_in_progress) {
+        do_write();
+    }
+}
+
+void Session::do_write() {
+    if (_write_queue.empty()) return;
+
+    _ws.async_write(net::buffer(_write_queue.front()), 
+        [self = shared_from_this()](beast::error_code ec, std::size_t) {
+            if (ec) {
+                self->cleanup();
+                return;
+            }
+            self->_write_queue.pop();
+            if (!self->_write_queue.empty()) {
+                self->do_write();
+            }
+        });
+}
+
+
 void Session::on_read(beast::error_code ec, std::size_t bytes_transferred) {
     if (ec == websocket::error::closed) { cleanup(); return; }
     if (ec) { cleanup(); return; }
@@ -212,7 +278,7 @@ void Session::on_read(beast::error_code ec, std::size_t bytes_transferred) {
 
 void Session::handle_read(const nlohmann::json& data) {
 
-    std::cout << "[Debug] Received JSON: " << data.dump() << std::endl;
+    // std::cout << "[Debug] Received JSON: " << data.dump() << std::endl;
 
 
     std::string type = data.value("type", "unknown");
@@ -251,7 +317,7 @@ void Session::cleanup() {
 }
 
 
-
+// --- 5. 主函数 ---
 int main() {
     try {
         net::io_context ioc;
