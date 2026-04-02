@@ -90,7 +90,7 @@
         myId = document.getElementById('userId').value.trim();
         if (!myId) return alert("请输入 ID");
 
-        ws = new WebSocket("ws://localhost:8080");
+        ws = new WebSocket("ws://114.132.52.242:8080");
         ws.onopen = () => {
             log("信令服务器连接成功", "#2ea043");
             sendJson({ type: "register", session_id: myId });
