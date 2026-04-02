@@ -5,6 +5,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <set>
 #include <mutex>
 #include <unordered_map>
 #include <nlohmann/json.hpp>
@@ -33,14 +34,20 @@ public:
     void register_user(const std::string& id, std::shared_ptr<Session> session);
     void remove_user(const std::string& id);
     void deliver(const std::string& target_id, const nlohmann::json& msg);
+    void broadcast(const std::string& room_id, const nlohmann::json& msg, std::shared_ptr<Session> exclude_session = nullptr);
+
+    void create_room(const std::string& room_id, std::shared_ptr<Session> session);
+    void join_room(const std::string& room_id, std::shared_ptr<Session> session);
+    void leave_room(const std::string& room_id, std::shared_ptr<Session> session);
 
     net::io_context& get_io_context() { return _ioc; }
 
 private:
     net::io_context& _ioc;
     tcp::acceptor _acceptor;
-    std::mutex _map_mutex;
+    std::recursive_mutex _map_mutex;
     std::unordered_map<std::string, std::shared_ptr<Session>> _sessions;
+    std::unordered_map<std::string, std::set<std::shared_ptr<Session>>> _rooms;
 };
 
 // 3. 定义 Session 类
@@ -64,6 +71,11 @@ public:
         });
     }
 
+    std::string get_session_id() const { return _session_id; }
+
+    void set_current_room(const std::string& room_id) { _current_room = room_id; }
+    std::string get_current_room() const { return _current_room; }
+
 private:
     void on_accept(beast::error_code ec) {
         if (ec) return;
@@ -82,6 +94,7 @@ private:
     beast::flat_buffer _buffer;
     std::shared_ptr<SignalingServer> _server;
     std::string _session_id;
+    std::string _current_room;
 };
 
 // --- 4. 定义成员函数实现 ---
@@ -98,19 +111,87 @@ void SignalingServer::start_accept() {
 }
 
 void SignalingServer::register_user(const std::string& id, std::shared_ptr<Session> session) {
-    std::lock_guard<std::mutex> lock(_map_mutex);
+    std::lock_guard<std::recursive_mutex> lock(_map_mutex);
     _sessions[id] = session;
+    session->send_json({{"type", "register_success"}, {"session_id", id}});
 }
 
 void SignalingServer::remove_user(const std::string& id) {
-    std::lock_guard<std::mutex> lock(_map_mutex);
+    std::lock_guard<std::recursive_mutex> lock(_map_mutex);
     _sessions.erase(id);
 }
 
 void SignalingServer::deliver(const std::string& target_id, const nlohmann::json& msg) {
-    std::lock_guard<std::mutex> lock(_map_mutex);
+    std::lock_guard<std::recursive_mutex> lock(_map_mutex);
     if (_sessions.contains(target_id)) {
-        _sessions[target_id]->send_json(msg); // 此时编译器已经知道 send_json 是什么了
+        _sessions[target_id]->send_json(msg);
+    }
+}
+
+void SignalingServer::broadcast(const std::string& room_id, const nlohmann::json& msg, std::shared_ptr<Session> exclude_session) {
+    std::lock_guard<std::recursive_mutex> lock(_map_mutex);
+    if (_rooms.contains(room_id)) {
+        for (auto& session : _rooms[room_id]) {
+            if (session != exclude_session) {
+                session->send_json(msg);
+            }
+        }
+    }
+}
+
+void SignalingServer::create_room(const std::string& room_id, std::shared_ptr<Session> session) {
+    if(room_id.empty()) {
+        session->send_json({{"type", "error"}, {"message", "Room ID cannot be empty"}});
+        std::cerr << "Failed to create room: Room ID cannot be empty" << std::endl;
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lock(_map_mutex);
+    if(!_rooms.contains(room_id)) {
+        _rooms[room_id].insert(session);
+        session->set_current_room(room_id);
+        std::cout << "Room Created: " << room_id << std::endl;
+        session->send_json({{"type", "create_room_success"}, {"room_id", room_id}});
+    }
+    else{
+        session->send_json({{"type", "error"}, {"message", "Room already exists"}});
+        std::cerr << "Room already exists: " << room_id << std::endl;
+    }
+}
+
+void SignalingServer::join_room(const std::string& room_id, std::shared_ptr<Session> session) {
+    std::lock_guard<std::recursive_mutex> lock(_map_mutex);
+    if(_rooms.contains(room_id) && !_rooms[room_id].contains(session)) {
+        _rooms[room_id].insert(session);
+        session->set_current_room(room_id);
+        broadcast(room_id, {{"type", "user_joined"}, {"session_id", session->get_session_id()}}, session);
+        session->send_json({{"type", "join_room_success"}, {"room_id", room_id}});
+        std::cout << "User " << session->get_session_id() << " joined room " << room_id << std::endl;
+    }
+    else if(!_rooms.contains(room_id)) {
+        session->send_json({{"type", "error"}, {"message", "Room does not exist"}});
+        std::cout << "User " << session->get_session_id() << " failed to join non-existent room " << room_id << std::endl;
+    }
+    else if(_rooms[room_id].contains(session)) {
+        session->send_json({{"type", "error"}, {"message", "Already in the room"}});
+        std::cout << "User " << session->get_session_id() << " is already in room " << room_id << std::endl;
+    }
+    else{
+        session->send_json({{"type", "error"}, {"message", "Unknown error joining room"}});
+        std::cerr << "Unknown error: User " << session->get_session_id() << " failed to join room " << room_id << std::endl;
+    }
+}
+
+void SignalingServer::leave_room(const std::string& room_id, std::shared_ptr<Session> session) {
+    std::lock_guard<std::recursive_mutex> lock(_map_mutex);
+    if (_rooms.contains(room_id)) {
+        _rooms[room_id].erase(session);
+        if (!_rooms[room_id].empty()) {
+            broadcast(room_id, {{"type", "user_left"}, {"session_id", session->get_session_id()}}, session);
+        }
+        else{
+            _rooms.erase(room_id);
+            std::cout << "Room " << room_id << " deleted as it became empty." << std::endl;
+        }
     }
 }
 
@@ -121,13 +202,19 @@ void Session::on_read(beast::error_code ec, std::size_t bytes_transferred) {
     try {
         std::string msg = beast::buffers_to_string(_buffer.data());
         handle_read(nlohmann::json::parse(msg));
-    } catch (...) {}
+    } catch (std::exception& e) {
+        std::cerr << "JSON parse error: " << e.what() << std::endl;
+    }
 
     _buffer.consume(bytes_transferred);
     do_read();
 }
 
 void Session::handle_read(const nlohmann::json& data) {
+
+    std::cout << "[Debug] Received JSON: " << data.dump() << std::endl;
+
+
     std::string type = data.value("type", "unknown");
     if (type == "register") {
         _session_id = data.value("session_id", "");
@@ -139,13 +226,28 @@ void Session::handle_read(const nlohmann::json& data) {
         std::string to = data.value("to", "");
         _server->deliver(to, data);
     }
+    else if (type == "join") {
+        std::string room = data.value("room", "");
+        _server->join_room(room, shared_from_this());
+    }
+    else if (type == "leave") {
+        std::string room = data.value("room", "");
+        _server->leave_room(room, shared_from_this());
+    }
+    else if (type == "create_room") {
+        std::string room = data.value("room", "");
+        _server->create_room(room, shared_from_this());
+    }
 }
 
 void Session::cleanup() {
     if (!_session_id.empty()) {
         _server->remove_user(_session_id);
-        std::cout << "User Offline: " << _session_id << std::endl;
     }
+    if(!_current_room.empty()) {
+        _server->leave_room(_current_room, shared_from_this());
+    }
+    std::cout << "User Offline: " << _session_id << std::endl;
 }
 
 
