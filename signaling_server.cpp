@@ -300,7 +300,7 @@ void Session::handle_read(const nlohmann::json& data) {
         std::string room = data.value("room", "");
         _server->leave_room(room, shared_from_this());
     }
-    else if (type == "create_room") {
+    else if (type == "create") {
         std::string room = data.value("room", "");
         _server->create_room(room, shared_from_this());
     }
