@@ -190,7 +190,7 @@ void SignalingServer::leave_room(const std::string& room_id, std::shared_ptr<Ses
     if (_rooms.contains(room_id)) {
         _rooms[room_id].erase(session);
         if (!_rooms[room_id].empty()) {
-            broadcast(room_id, {{"type", "user_left"}, {"session_id", session->get_session_id()}}, session);
+            broadcast(room_id, {{"type", "leave"}, {"session_id", session->get_session_id()}}, session);
         }
         else{
             _rooms.erase(room_id);
@@ -303,6 +303,14 @@ void Session::handle_read(const nlohmann::json& data) {
     else if (type == "create") {
         std::string room = data.value("room", "");
         _server->create_room(room, shared_from_this());
+    }
+    else if (type == "media_state") {
+        std::string room = data.value("room", "");
+        _server->broadcast(room, data, shared_from_this());
+    }
+    else{
+        std::cerr << "Unknown message type: " << type << std::endl;
+        std::cerr << "Full message: " << data.dump() << std::endl;
     }
 }
 
