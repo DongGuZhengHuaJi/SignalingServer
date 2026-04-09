@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 #include <future>
 #include "thread_pool.hpp"
+#include "redis_mgr.h"
 
 namespace net = boost::asio;
 namespace beast = boost::beast;
@@ -75,6 +76,7 @@ private:
     void do_write();
     
     void cleanup();
+    void close_socket(websocket::close_code code = websocket::close_code::policy_error);
 
     websocket::stream<beast::tcp_stream> _ws;
     beast::flat_buffer _buffer;
@@ -276,17 +278,67 @@ void Session::on_read(beast::error_code ec, std::size_t bytes_transferred) {
     do_read();
 }
 
+void Session::close_socket(websocket::close_code code) {
+    beast::error_code close_ec;
+    _ws.close(code, close_ec);
+    if (close_ec && close_ec != websocket::error::closed) {
+        std::cerr << "WebSocket close error: " << close_ec.message() << std::endl;
+    }
+}
+
 void Session::handle_read(const nlohmann::json& data) {
 
     // std::cout << "[Debug] Received JSON: " << data.dump() << std::endl;
 
 
     std::string type = data.value("type", "unknown");
+    std::string token = data.value("access_token", data.value("token", ""));
+    if (token.empty()) {
+        std::cerr << "Missing token in message" << std::endl;
+        send_json({{"type", "error"}, {"message", "Missing token"}});
+        cleanup();
+        close_socket();
+        return;
+    }
+    
+    RedisManager& redis = RedisManager::getInstance();
+    std::string token_id;
+    bool access_hit = redis.get("access:" + token, token_id) && !token_id.empty();
+
+    if(!access_hit) {
+        std::cerr << "Invalid or expired token: " << token << std::endl;
+        send_json({{"type", "error"}, {"message", "Invalid or expired token"}});
+        cleanup();
+        close_socket();
+        return;
+    }
+    if(!_session_id.empty() && _session_id != token_id) {
+        std::cerr << "Token does not match session_id: " << token_id << " vs " << _session_id << std::endl;
+        send_json({{"type", "error"}, {"message", "Token does not match session_id"}});
+        cleanup();
+        close_socket();
+        return;
+    }
+    if(type != "register" && _session_id.empty()) {
+        std::cerr << "Unauthenticated message type before register: " << type << std::endl;
+        send_json({{"type", "error"}, {"message", "Must register before sending business messages"}});
+        cleanup();
+        close_socket();
+        return;
+    }
+
     if (type == "register") {
-        _session_id = data.value("session_id", "");
-        if (!_session_id.empty()) {
+        if(token_id == data.value("session_id", "")) {
+            _session_id = token_id;
             _server->register_user(_session_id, shared_from_this());
-            std::cout << "User Registered: " << _session_id << std::endl;
+            std::cout << "User Registered: " << _session_id << std::endl;   
+        }
+        else{
+            std::cerr << "Token does not match session_id: " << token_id << " vs " << data.value("session_id", "") << std::endl;
+            send_json({{"type", "error"}, {"message", "Token does not match session_id"}});
+            cleanup();
+            close_socket();
+            return;
         }
     } else if (type == "offer" || type == "answer" || type == "candidate") {
         std::string to = data.value("to", "");
