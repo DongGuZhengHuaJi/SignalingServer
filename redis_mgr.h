@@ -74,16 +74,38 @@ private:
     private:
     sw::redis::Redis _redis;
 
+    static std::string env_or_default(const char* key, const std::string& default_value) {
+        const char* value = std::getenv(key);
+        if (value == nullptr || value[0] == '\0') {
+            return default_value;
+        }
+        return value;
+    }
+
+    static int env_int_or_default(const char* key, int default_value) {
+        const char* value = std::getenv(key);
+        if (value == nullptr || value[0] == '\0') {
+            return default_value;
+        }
+        try {
+            return std::stoi(value);
+        } catch (...) {
+            return default_value;
+        }
+    }
+
     // 辅助函数：配置基础连接
     static sw::redis::ConnectionOptions create_options() {
         sw::redis::ConnectionOptions opts;
-        opts.host = "127.0.0.1";
-        opts.port = 6379;
-        const char* redis_password = std::getenv("REDIS_PASSWORD");
-        if (redis_password != nullptr && redis_password[0] != '\0') {
+        opts.host = env_or_default("REDIS_HOST", "127.0.0.1");
+        opts.port = env_int_or_default("REDIS_PORT", 6379);
+
+        const std::string redis_password = env_or_default("REDIS_PASSWORD", "");
+        if (!redis_password.empty()) {
             opts.password = redis_password;
         }
-        opts.db = 0;
+
+        opts.db = env_int_or_default("REDIS_DB", 0);
         return opts;
     }
 
