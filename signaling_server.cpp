@@ -10,6 +10,7 @@
 #include <queue>
 #include <mutex>
 #include <unordered_map>
+#include <optional>
 #include <nlohmann/json.hpp>
 #include <future>
 #include "thread_pool.hpp"
@@ -22,6 +23,7 @@ using tcp = net::ip::tcp;
 
 namespace {
 constexpr const char* kReservationEventChannel = "meeting:reservation_events";
+constexpr const char* kRoomClosedEventChannel = "meeting:room_closed_events";
 }
 
 
@@ -31,11 +33,14 @@ class SignalingServer;
 
 struct Room{
     std::string room_id;
+    std::string meeting_type; // quick | reserved
     std::set<std::string> participants; // 存储用户ID
-    std::set<std::shared_ptr<Session>> sessions; // 存储用户的Session对象
+    std::set<std::shared_ptr<Session>> current_sessions; // 存储用户的Session对象
     std::string host_id; // 房主ID
     std::chrono::system_clock::time_point start_time; // 预约时间
-    Room(std::string room_id_, std::chrono::system_clock::time_point start_time_ = std::chrono::system_clock::now()): room_id(std::move(room_id_)), start_time(start_time_) {}
+    std::chrono::system_clock::time_point empty_time; // 变空的时间点
+    Room(std::string room_id_, std::chrono::system_clock::time_point start_time_ = std::chrono::system_clock::now())
+        : room_id(std::move(room_id_)), meeting_type("quick"), start_time(start_time_) {}
 };
 
 // 2. 定义 SignalingServer 类
@@ -57,7 +62,10 @@ public:
     void create_reserved_room(const std::string& room_id, const std::string& host_id,
                               std::chrono::system_clock::time_point start_time);
     void join_room(const std::string& room_id, std::shared_ptr<Session> session);
-    void leave_room(const std::string& room_id, std::shared_ptr<Session> session);
+    void leave_room(const std::string& room_id, std::shared_ptr<Session> session, bool end_meeting = false);
+
+    void remove_room(const std::string& room_id, const std::string& reason = "empty_timeout");
+    void remove_empty_rooms();
 
 
     net::io_context& get_io_context();
@@ -68,6 +76,8 @@ private:
     std::recursive_mutex _map_mutex;
     std::unordered_map<std::string, std::shared_ptr<Session>> _sessions;
     std::unordered_map<std::string, Room> _rooms;
+    std::unordered_map<std::string, std::chrono::system_clock::time_point> _empty_rooms;
+    std::unique_ptr<net::steady_timer> _empty_room_timer;
 };
 
 // 3. 定义 Session 类
@@ -110,13 +120,20 @@ private:
 
 // --- SignalingServer 类实现 ---
 SignalingServer::SignalingServer(net::io_context& ioc, short port)
-    : _ioc(ioc), _acceptor(ioc, tcp::endpoint(tcp::v4(), port)) {}
+    : _ioc(ioc), _acceptor(ioc, tcp::endpoint(tcp::v4(), port)), _empty_room_timer(std::make_unique<net::steady_timer>(_ioc)) {}
 
 void SignalingServer::start() {
     start_accept();
+
+    // 启动定时器定期清理空房间
+    remove_empty_rooms();
 }
 
 void SignalingServer::stop() {
+    if (_empty_room_timer) {
+        boost::system::error_code ec;
+        _empty_room_timer->cancel(ec);
+    }
     _ioc.stop();
 }
 
@@ -158,7 +175,7 @@ void SignalingServer::broadcast(const std::string& room_id, const nlohmann::json
     std::lock_guard<std::recursive_mutex> lock(_map_mutex);
     auto room_it = _rooms.find(room_id);
     if (room_it != _rooms.end()) {
-        for (auto& session : room_it->second.sessions) {
+        for (auto& session : room_it->second.current_sessions) {
             if (session != exclude_session) {
                 session->send_json(msg);
             }
@@ -177,8 +194,9 @@ void SignalingServer::create_room(const std::string& room_id, std::shared_ptr<Se
     if(_rooms.find(room_id) == _rooms.end()) {
         Room room(room_id, start_time);
         room.room_id = room_id;
+        room.meeting_type = "quick";
         room.host_id = session->get_session_id();
-        room.sessions.insert(session);
+        room.current_sessions.insert(session);
         if (!room.host_id.empty()) {
             room.participants.insert(room.host_id);
         }
@@ -203,6 +221,7 @@ void SignalingServer::create_reserved_room(const std::string& room_id, const std
     auto room_it = _rooms.find(room_id);
     if (room_it == _rooms.end()) {
         Room room(room_id, start_time);
+        room.meeting_type = "reserved";
         room.host_id = host_id;
         if (!host_id.empty()) {
             room.participants.insert(host_id);
@@ -213,6 +232,7 @@ void SignalingServer::create_reserved_room(const std::string& room_id, const std
     }
 
     room_it->second.start_time = start_time;
+    room_it->second.meeting_type = "reserved";
     if (!host_id.empty()) {
         room_it->second.host_id = host_id;
         room_it->second.participants.insert(host_id);
@@ -222,17 +242,21 @@ void SignalingServer::create_reserved_room(const std::string& room_id, const std
 void SignalingServer::join_room(const std::string& room_id, std::shared_ptr<Session> session) {
     std::lock_guard<std::recursive_mutex> lock(_map_mutex);
     auto room_it = _rooms.find(room_id);
-    if(room_it != _rooms.end() && room_it->second.sessions.find(session) == room_it->second.sessions.end()) {
+    if(room_it != _rooms.end() && room_it->second.current_sessions.find(session) == room_it->second.current_sessions.end()) {
         if(room_it->second.start_time>std::chrono::system_clock::now()) {
             session->send_json({{"type", "error"}, {"message", "Cannot join room before start time"}});
             std::cerr << "User " << session->get_session_id() << " cannot join room " << room_id << " before start time" << std::endl;
             return;
         }
-        room_it->second.sessions.insert(session);
+        room_it->second.current_sessions.insert(session);
         if (!session->get_session_id().empty()) {
             room_it->second.participants.insert(session->get_session_id());
         }
         session->set_current_room(room_id);
+        if(_empty_rooms.find(room_id) != _empty_rooms.end()) {
+            room_it->second.empty_time = std::chrono::system_clock::time_point(); // 重置变空时间
+            _empty_rooms.erase(room_id);
+        }
         broadcast(room_id, {{"type", "user_joined"}, {"session_id", session->get_session_id()}}, session);
         session->send_json({{"type", "join_room_success"}, {"room_id", room_id}});
         std::cout << "User " << session->get_session_id() << " joined room " << room_id << std::endl;
@@ -241,7 +265,7 @@ void SignalingServer::join_room(const std::string& room_id, std::shared_ptr<Sess
         session->send_json({{"type", "error"}, {"message", "Room does not exist"}});
         std::cout << "User " << session->get_session_id() << " failed to join non-existent room " << room_id << std::endl;
     }
-    else if(room_it->second.sessions.find(session) != room_it->second.sessions.end()) {
+    else if(room_it->second.current_sessions.find(session) != room_it->second.current_sessions.end()) {
         session->send_json({{"type", "error"}, {"message", "Already in the room"}});
         std::cout << "User " << session->get_session_id() << " is already in room " << room_id << std::endl;
     }
@@ -251,21 +275,40 @@ void SignalingServer::join_room(const std::string& room_id, std::shared_ptr<Sess
     }
 }
 
-void SignalingServer::leave_room(const std::string& room_id, std::shared_ptr<Session> session) {
+void SignalingServer::leave_room(const std::string& room_id, std::shared_ptr<Session> session, bool end_meeting) {
     std::lock_guard<std::recursive_mutex> lock(_map_mutex);
     auto room_it = _rooms.find(room_id);
     if (room_it != _rooms.end()) {
-        room_it->second.sessions.erase(session);
-        if (!session->get_session_id().empty()) {
-            room_it->second.participants.erase(session->get_session_id());
+        const std::string leaving_id = session->get_session_id();
+        const bool host_left = !leaving_id.empty() && leaving_id == room_it->second.host_id;
+
+        room_it->second.current_sessions.erase(session);
+
+        if (host_left && end_meeting) {
+            remove_room(room_id, "host_end");
+            return;
         }
 
-        if (!room_it->second.sessions.empty()) {
-            broadcast(room_id, {{"type", "leave"}, {"session_id", session->get_session_id()}}, session);
+        //todo: 可以考虑如果房主离开但会议未结束，自动转移房主身份给其他参与者
+        // if (host_left && !room_it->second.current_sessions.empty()) {
+        //     std::string new_host;
+        //     for (const auto& sess : room_it->second.current_sessions) {
+        //         const std::string candidate = sess->get_session_id();
+        //         if (!candidate.empty()) {
+        //             new_host = candidate;
+        //             break;
+        //         }
+        //     }
+        //     room_it->second.host_id = new_host;
+        // }
+
+        if (!room_it->second.current_sessions.empty()) {
+            broadcast(room_id, {{"type", "user_left"}, {"session_id", leaving_id}}, session);
         }
         else{
-            _rooms.erase(room_id);
-            std::cout << "Room " << room_id << " deleted as it became empty." << std::endl;
+            room_it->second.empty_time = std::chrono::system_clock::now();
+            _empty_rooms[room_id] = room_it->second.empty_time;
+            std::cout << "Room " << room_id << " marked as empty." << std::endl;
         }
     }
 }
@@ -419,7 +462,8 @@ void Session::handle_read(const nlohmann::json& data) {
     }
     else if (type == "leave") {
         std::string room = data.value("room", "");
-        _server->leave_room(room, shared_from_this());
+        const bool end_meeting = data.value("end_meeting", false);
+        _server->leave_room(room, shared_from_this(), end_meeting);
     }
     else if (type == "create") {
         std::string room = data.value("room", "");
@@ -440,7 +484,7 @@ void Session::cleanup() {
         _server->remove_user(_session_id);
     }
     if(!_current_room.empty()) {
-        _server->leave_room(_current_room, shared_from_this());
+        _server->leave_room(_current_room, shared_from_this(), false);
     }
     std::cout << "User Offline: " << _session_id << std::endl;
 }
@@ -490,6 +534,74 @@ void start_reservation_subscription(const std::shared_ptr<SignalingServer>& serv
             std::cerr << "Reservation subscription stopped: " << e.what() << std::endl;
         }
     }).detach();
+}
+
+void SignalingServer::remove_room(const std::string& room_id, const std::string& reason) {
+    std::lock_guard<std::recursive_mutex> lock(_map_mutex);
+    auto room_it = _rooms.find(room_id);
+    if (room_it == _rooms.end()) {
+        return;
+    }
+
+    Room& room = room_it->second;
+
+    for(auto session_id: room.participants) {
+        if(_sessions.find(session_id) != _sessions.end()) {
+            _sessions[session_id]->set_current_room("");
+            _sessions[session_id]->send_json({
+                {"type", "room_closed"},
+                {"room_id", room.room_id},
+                {"reason", reason},
+                {"meeting_type", room.meeting_type}
+            });
+        }
+    }
+    _rooms.erase(room.room_id);
+    if(_empty_rooms.find(room.room_id) != _empty_rooms.end()) {
+        _empty_rooms.erase(room.room_id);
+    }
+
+    RedisManager& redis_mgr = RedisManager::getInstance();
+    nlohmann::json close_event = {
+        {"type", "room_closed"},
+        {"room_id", room.room_id},
+        {"reason", reason},
+        {"meeting_type", room.meeting_type}
+    };
+    const long long subscriber_count = redis_mgr.getClient().publish(kRoomClosedEventChannel, close_event.dump());
+    if (subscriber_count <= 0) {
+        std::cerr << "No subscriber for room closed event of room " << room.room_id << std::endl;
+    }
+    
+    std::cout << "Room removed: " << room.room_id << std::endl;
+}
+
+void SignalingServer::remove_empty_rooms() {
+    _empty_room_timer->expires_after(std::chrono::minutes(5));
+    _empty_room_timer->async_wait([server = shared_from_this()](const boost::system::error_code& ec) {
+        if (ec) {
+            std::cerr << "Timer error: " << ec.message() << std::endl;
+            return;
+        }
+
+        std::vector<std::string> expired_room_ids;
+        {
+            std::lock_guard<std::recursive_mutex> lock(server->_map_mutex);
+            const auto now = std::chrono::system_clock::now();
+            for (const auto& [room_id, empty_time] : server->_empty_rooms) {
+                if (now - empty_time > std::chrono::minutes(15)) {
+                    expired_room_ids.push_back(room_id);
+                }
+            }
+        }
+
+        for (const auto& room_id : expired_room_ids) {
+            server->remove_room(room_id, "empty_timeout");
+            std::cout << "Deleted empty room: " << room_id << std::endl;
+        }
+
+        server->remove_empty_rooms(); // 继续设置下一次检查
+    });
 }
 
 
