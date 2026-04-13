@@ -10,7 +10,6 @@
 #include <queue>
 #include <mutex>
 #include <unordered_map>
-#include <optional>
 #include <nlohmann/json.hpp>
 #include <future>
 #include "thread_pool.hpp"
@@ -203,7 +202,13 @@ void SignalingServer::create_room(const std::string& room_id, std::shared_ptr<Se
         _rooms.emplace(room_id, std::move(room));
         session->set_current_room(room_id);
         std::cout << "Room Created: " << room_id << std::endl;
-        session->send_json({{"type", "create_room_success"}, {"room_id", room_id}});
+        session->send_json({
+            {"type", "create_room_success"},
+            {"room_id", room_id},
+            {"is_host", true},
+            {"host_id", session->get_session_id()},
+            {"meeting_type", "quick"}
+        });
     }
     else{
         session->send_json({{"type", "error"}, {"message", "Room already exists"}});
@@ -257,8 +262,15 @@ void SignalingServer::join_room(const std::string& room_id, std::shared_ptr<Sess
             room_it->second.empty_time = std::chrono::system_clock::time_point(); // 重置变空时间
             _empty_rooms.erase(room_id);
         }
+        const bool joined_is_host = (!session->get_session_id().empty() && session->get_session_id() == room_it->second.host_id);
         broadcast(room_id, {{"type", "user_joined"}, {"session_id", session->get_session_id()}}, session);
-        session->send_json({{"type", "join_room_success"}, {"room_id", room_id}});
+        session->send_json({
+            {"type", "join_room_success"},
+            {"room_id", room_id},
+            {"is_host", joined_is_host},
+            {"host_id", room_it->second.host_id},
+            {"meeting_type", room_it->second.meeting_type}
+        });
         std::cout << "User " << session->get_session_id() << " joined room " << room_id << std::endl;
     }
     else if(room_it == _rooms.end()) {
