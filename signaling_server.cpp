@@ -555,37 +555,37 @@ void SignalingServer::remove_room(const std::string& room_id, const std::string&
         return;
     }
 
-    Room& room = room_it->second;
+    const Room room_snapshot = room_it->second;
 
-    for(auto session_id: room.participants) {
+    for(auto session_id: room_snapshot.participants) {
         if(_sessions.find(session_id) != _sessions.end()) {
             _sessions[session_id]->set_current_room("");
             _sessions[session_id]->send_json({
                 {"type", "room_closed"},
-                {"room_id", room.room_id},
+                {"room_id", room_snapshot.room_id},
                 {"reason", reason},
-                {"meeting_type", room.meeting_type}
+                {"meeting_type", room_snapshot.meeting_type}
             });
         }
     }
-    _rooms.erase(room.room_id);
-    if(_empty_rooms.find(room.room_id) != _empty_rooms.end()) {
-        _empty_rooms.erase(room.room_id);
+    _rooms.erase(room_snapshot.room_id);
+    if(_empty_rooms.find(room_snapshot.room_id) != _empty_rooms.end()) {
+        _empty_rooms.erase(room_snapshot.room_id);
     }
 
     RedisManager& redis_mgr = RedisManager::getInstance();
     nlohmann::json close_event = {
         {"type", "room_closed"},
-        {"room_id", room.room_id},
+        {"room_id", room_snapshot.room_id},
         {"reason", reason},
-        {"meeting_type", room.meeting_type}
+        {"meeting_type", room_snapshot.meeting_type}
     };
     const long long subscriber_count = redis_mgr.getClient().publish(kRoomClosedEventChannel, close_event.dump());
     if (subscriber_count <= 0) {
-        std::cerr << "No subscriber for room closed event of room " << room.room_id << std::endl;
+        std::cerr << "No subscriber for room closed event of room " << room_snapshot.room_id << std::endl;
     }
     
-    std::cout << "Room removed: " << room.room_id << std::endl;
+    std::cout << "Room removed: " << room_snapshot.room_id << std::endl;
 }
 
 void SignalingServer::remove_empty_rooms() {
