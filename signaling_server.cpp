@@ -32,7 +32,7 @@ class SignalingServer;
 
 struct Room{
     std::string room_id;
-    std::string meeting_type; // quick | reserved
+    std::string meeting_type; // quick | reserved | screen_share
     std::set<std::string> participants; // 存储用户ID
     std::set<std::shared_ptr<Session>> current_sessions; // 存储用户的Session对象
     std::string host_id; // 房主ID
@@ -57,7 +57,8 @@ public:
     void broadcast(const std::string& room_id, const nlohmann::json& msg, std::shared_ptr<Session> exclude_session = nullptr);
 
     void create_room(const std::string& room_id, std::shared_ptr<Session> session,
-                     std::chrono::system_clock::time_point start_time = std::chrono::system_clock::now());
+                     std::chrono::system_clock::time_point start_time = std::chrono::system_clock::now(),
+                     const std::string& meeting_type = "quick");
     void create_reserved_room(const std::string& room_id, const std::string& host_id,
                               std::chrono::system_clock::time_point start_time);
     void join_room(const std::string& room_id, std::shared_ptr<Session> session);
@@ -183,17 +184,26 @@ void SignalingServer::broadcast(const std::string& room_id, const nlohmann::json
 }
 
 void SignalingServer::create_room(const std::string& room_id, std::shared_ptr<Session> session,
-                                  std::chrono::system_clock::time_point start_time) {
+                                  std::chrono::system_clock::time_point start_time,
+                                  const std::string& meeting_type) {
     if(room_id.empty()) {
         session->send_json({{"type", "error"}, {"message", "Room ID cannot be empty"}});
         std::cerr << "Failed to create room: Room ID cannot be empty" << std::endl;
         return;
     }
+
+    std::string normalized_type = meeting_type;
+    if (normalized_type != "quick" &&
+        normalized_type != "reserved" &&
+        normalized_type != "screen_share") {
+        normalized_type = "quick";
+    }
+
     std::lock_guard<std::recursive_mutex> lock(_map_mutex);
     if(_rooms.find(room_id) == _rooms.end()) {
         Room room(room_id, start_time);
         room.room_id = room_id;
-        room.meeting_type = "quick";
+        room.meeting_type = normalized_type;
         room.host_id = session->get_session_id();
         room.current_sessions.insert(session);
         if (!room.host_id.empty()) {
@@ -207,7 +217,7 @@ void SignalingServer::create_room(const std::string& room_id, std::shared_ptr<Se
             {"room_id", room_id},
             {"is_host", true},
             {"host_id", session->get_session_id()},
-            {"meeting_type", "quick"}
+            {"meeting_type", room.meeting_type}
         });
     }
     else{
@@ -479,7 +489,8 @@ void Session::handle_read(const nlohmann::json& data) {
     }
     else if (type == "create") {
         std::string room = data.value("room", "");
-        _server->create_room(room, shared_from_this(), std::chrono::system_clock::now());
+        std::string meeting_type = data.value("meeting_type", "quick");
+        _server->create_room(room, shared_from_this(), std::chrono::system_clock::now(), meeting_type);
     }
     else if (type == "media_state") {
         std::string room = data.value("room", "");
