@@ -496,6 +496,10 @@ void Session::handle_read(const nlohmann::json& data) {
         std::string room = data.value("room", "");
         _server->broadcast(room, data, shared_from_this());
     }
+    else if (type == "chat") {
+        std::string room = data.value("room", "");
+        _server->broadcast(room, data, shared_from_this());
+    }
     else{
         std::cerr << "Unknown message type: " << type << std::endl;
         std::cerr << "Full message: " << data.dump() << std::endl;
