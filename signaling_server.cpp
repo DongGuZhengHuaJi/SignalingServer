@@ -51,7 +51,7 @@ public:
     void stop();
     void start_accept();
 
-    void register_user(const std::string& id, std::shared_ptr<Session> session);
+    void register_user(const std::string& id, const std::string& self_name, std::shared_ptr<Session> session);
     void remove_user(const std::string& id);
     void deliver(const std::string& target_id, const nlohmann::json& msg);
     void broadcast(const std::string& room_id, const nlohmann::json& msg, std::shared_ptr<Session> exclude_session = nullptr);
@@ -90,6 +90,8 @@ public:
     void send_json(const nlohmann::json& msg);
 
     std::string get_session_id() const;
+    std::string get_self_name() const;
+    void set_self_name(const std::string& self_name);
 
     void set_current_room(const std::string& room_id);
     std::string get_current_room() const;
@@ -111,6 +113,7 @@ private:
     beast::flat_buffer _buffer;
     std::shared_ptr<SignalingServer> _server;
     std::string _session_id;
+    std::string _self_name;
     std::string _current_room;
     std::queue<std::string> _write_queue;
 };
@@ -152,10 +155,11 @@ void SignalingServer::start_accept() {
         });
 }
 
-void SignalingServer::register_user(const std::string& id, std::shared_ptr<Session> session) {
+void SignalingServer::register_user(const std::string& id, const std::string& self_name, std::shared_ptr<Session> session) {
     std::lock_guard<std::recursive_mutex> lock(_map_mutex);
     _sessions[id] = session;
-    session->send_json({{"type", "register_success"}, {"session_id", id}});
+    session->set_self_name(self_name.empty() ? id : self_name);
+    session->send_json({{"type", "register_success"}, {"session_id", id}, {"self_name", session->get_self_name()}});
 }
 
 void SignalingServer::remove_user(const std::string& id) {
@@ -181,6 +185,18 @@ void SignalingServer::broadcast(const std::string& room_id, const nlohmann::json
             }
         }
     }
+}
+
+std::string Session::get_session_id() const {
+    return _session_id;
+}
+
+std::string Session::get_self_name() const {
+    return _self_name.empty() ? _session_id : _self_name;
+}
+
+void Session::set_self_name(const std::string& self_name) {
+    _self_name = self_name;
 }
 
 void SignalingServer::create_room(const std::string& room_id, std::shared_ptr<Session> session,
@@ -273,7 +289,12 @@ void SignalingServer::join_room(const std::string& room_id, std::shared_ptr<Sess
             _empty_rooms.erase(room_id);
         }
         const bool joined_is_host = (!session->get_session_id().empty() && session->get_session_id() == room_it->second.host_id);
-        broadcast(room_id, {{"type", "user_joined"}, {"session_id", session->get_session_id()}}, session);
+        broadcast(room_id, {
+            {"type", "user_joined"},
+            {"session_id", session->get_session_id()},
+            {"from", session->get_session_id()},
+            {"from_name", session->get_self_name()}
+        }, session);
         session->send_json({
             {"type", "join_room_success"},
             {"room_id", room_id},
@@ -349,10 +370,6 @@ void Session::send_json(const nlohmann::json& msg) {
     net::post(_ws.get_executor(), [self = shared_from_this(), msg_str]() {
         self->queue_write(std::move(msg_str));
     });
-}
-
-std::string Session::get_session_id() const {
-    return _session_id;
 }
 
 void Session::set_current_room(const std::string& room_id) {
@@ -464,7 +481,9 @@ void Session::handle_read(const nlohmann::json& data) {
     if (type == "register") {
         if(token_id == data.value("session_id", "")) {
             _session_id = token_id;
-            _server->register_user(_session_id, shared_from_this());
+            const std::string self_name = data.value("self_name", _session_id);
+            _self_name = self_name.empty() ? _session_id : self_name;
+            _server->register_user(_session_id, _self_name, shared_from_this());
             std::cout << "User Registered: " << _session_id << std::endl;   
         }
         else{
