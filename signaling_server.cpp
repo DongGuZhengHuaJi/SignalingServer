@@ -1,4 +1,5 @@
 #include <boost/asio.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/beast.hpp>
 #include <iostream>
 #include <memory>
@@ -96,6 +97,11 @@ public:
     void set_current_room(const std::string& room_id);
     std::string get_current_room() const;
 
+
+    void start_heartbeat();
+    void schedule_heartbeat();
+    void reset_heartbeat();
+    void stop_heartbeat();
 private:
     void on_accept(beast::error_code ec);
 
@@ -116,6 +122,9 @@ private:
     std::string _self_name;
     std::string _current_room;
     std::queue<std::string> _write_queue;
+
+    net::steady_timer _heartbeat_timer;
+    std::chrono::system_clock::time_point _last_heartbeat;
 };
 
 // --- 4. 定义成员函数实现 ---
@@ -358,7 +367,7 @@ void SignalingServer::leave_room(const std::string& room_id, std::shared_ptr<Ses
 
 // --- Session 类实现 ---
 Session::Session(tcp::socket socket, std::shared_ptr<SignalingServer> server)
-    : _ws(std::move(socket)), _server(server) {}
+    : _ws(std::move(socket)), _server(server), _heartbeat_timer(_ws.get_executor()) {}
 
 void Session::start() {
     _ws.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
@@ -485,6 +494,8 @@ void Session::handle_read(const nlohmann::json& data) {
             _self_name = self_name.empty() ? _session_id : self_name;
             _server->register_user(_session_id, _self_name, shared_from_this());
             std::cout << "User Registered: " << _session_id << std::endl;   
+
+            start_heartbeat();
         }
         else{
             std::cerr << "Token does not match session_id: " << token_id << " vs " << data.value("session_id", "") << std::endl;
@@ -519,6 +530,9 @@ void Session::handle_read(const nlohmann::json& data) {
         std::string room = data.value("room", "");
         _server->broadcast(room, data, shared_from_this());
     }
+    else if (type == "pong") {
+        reset_heartbeat();
+    }
     else{
         std::cerr << "Unknown message type: " << type << std::endl;
         std::cerr << "Full message: " << data.dump() << std::endl;
@@ -533,6 +547,41 @@ void Session::cleanup() {
         _server->leave_room(_current_room, shared_from_this(), false);
     }
     std::cout << "User Offline: " << _session_id << std::endl;
+}
+
+void Session::start_heartbeat() {
+    _last_heartbeat = std::chrono::system_clock::now();
+    schedule_heartbeat();
+}
+
+void Session::schedule_heartbeat() {
+    _heartbeat_timer.expires_after(std::chrono::seconds(30));
+    _heartbeat_timer.async_wait([self = shared_from_this()](const boost::system::error_code& ec) {
+        if (ec) {
+            return;
+        }
+        if(std::chrono::system_clock::now() - self->_last_heartbeat > std::chrono::seconds(40)) {
+            std::cerr << "Heartbeat timeout for session " << self->_session_id << std::endl;
+            self->cleanup();
+            self->close_socket();
+            return;
+        }
+
+        self->send_json({{"type", "ping"}});
+        self->schedule_heartbeat();
+    });
+}
+
+void Session::reset_heartbeat() {
+    _last_heartbeat = std::chrono::system_clock::now();
+}
+
+void Session::stop_heartbeat() {
+    boost::system::error_code ec;
+    _heartbeat_timer.cancel(ec);
+    if (ec) {
+        std::cerr << "Error stopping heartbeat timer: " << ec.message() << std::endl;
+    }
 }
 
 void start_reservation_subscription(const std::shared_ptr<SignalingServer>& server) {
