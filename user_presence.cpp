@@ -248,7 +248,12 @@ void UserPresence::on_connection_lost(std::shared_ptr<Connection> conn) {
     _hover_timer.expires_after(std::chrono::seconds(30));
     _hover_timer.async_wait([self = weak_from_this()](beast::error_code ec) {
         if (ec) return;  // 被取消（重连成功）
-        if (auto s = self.lock()) s->on_hover_timeout();
+        if (auto s = self.lock()) {
+            if (!s->_current_room.empty()) {
+                s->_server->broadcast(s->_current_room, {{"type", "user_connection_lost"}, {"from", s->_user_id}, {"from_name", s->_self_name}});
+            }
+            s->on_hover_timeout();
+        }
     });
 
 
@@ -258,6 +263,7 @@ void UserPresence::on_hover_timeout() {
     if (_status == UserStatus::RECONNECTING) {
         std::cerr << "Hover timeout, marking user " << _user_id << " as offline" << std::endl;
         _status = UserStatus::OFFLINE;
+        // 连接丢失后30秒内未重连成功，执行离线清理,包括从房间移除用户、通知其他用户等
         cleanup();
     }
 }
@@ -268,4 +274,9 @@ void  UserPresence::on_connection_recovered() {
     std::cout << "Connection recovered for user " << _user_id << std::endl;
     stop_heartbeat();
     start_heartbeat();
+
+    // 重连成功以后恢复用户状态，通知房间内其他用户，其他用户客户端收到消息向该用户重新发送offer等必要信息
+    if (!_current_room.empty()) {
+        _server->broadcast(_current_room, {{"type", "user_reconnected"}, {"from", _user_id}, {"from_name", _self_name}}, shared_from_this());
+    }
 }
