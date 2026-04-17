@@ -11,10 +11,16 @@
 #include <queue>
 #include <mutex>
 #include <unordered_map>
+#include <random>
+#include <sstream>
 #include <nlohmann/json.hpp>
 #include <future>
 #include "thread_pool.hpp"
 #include "redis_mgr.h"
+#include "room_mgr.h"
+#include "connection.h"
+#include "user_presence.h"
+#include "signaling_server.h"
 
 namespace net = boost::asio;
 namespace beast = boost::beast;
@@ -24,110 +30,19 @@ using tcp = net::ip::tcp;
 namespace {
 constexpr const char* kReservationEventChannel = "meeting:reservation_events";
 constexpr const char* kRoomClosedEventChannel = "meeting:room_closed_events";
+
+std::string generate_reconnect_token() {
+    static std::random_device rd;
+    static std::mt19937_64 gen(rd());
+    static std::uniform_int_distribution<unsigned long long> dis;
+
+    std::ostringstream oss;
+    oss << std::hex;
+    oss << dis(gen) << dis(gen);
+    return oss.str();
 }
-
-
-// 1. 前向声明两个类
-class Session;
-class SignalingServer;
-
-struct Room{
-    std::string room_id;
-    std::string meeting_type; // quick | reserved | screen_share
-    std::set<std::string> participants; // 存储用户ID
-    std::set<std::shared_ptr<Session>> current_sessions; // 存储用户的Session对象
-    std::string host_id; // 房主ID
-    std::chrono::system_clock::time_point start_time; // 预约时间
-    std::chrono::system_clock::time_point empty_time; // 变空的时间点
-    Room(std::string room_id_, std::chrono::system_clock::time_point start_time_ = std::chrono::system_clock::now())
-        : room_id(std::move(room_id_)), meeting_type("quick"), start_time(start_time_) {}
-};
-
-// 2. 定义 SignalingServer 类
-class SignalingServer : public std::enable_shared_from_this<SignalingServer> {
-public:
-    SignalingServer(net::io_context& ioc, short port);
-
-    void start();
-    void stop();
-    void start_accept();
-
-    void register_user(const std::string& id, const std::string& self_name, std::shared_ptr<Session> session);
-    void remove_user(const std::string& id);
-    void deliver(const std::string& target_id, const nlohmann::json& msg);
-    void broadcast(const std::string& room_id, const nlohmann::json& msg, std::shared_ptr<Session> exclude_session = nullptr);
-
-    void create_room(const std::string& room_id, std::shared_ptr<Session> session,
-                     std::chrono::system_clock::time_point start_time = std::chrono::system_clock::now(),
-                     const std::string& meeting_type = "quick");
-    void create_reserved_room(const std::string& room_id, const std::string& host_id,
-                              std::chrono::system_clock::time_point start_time);
-    void join_room(const std::string& room_id, std::shared_ptr<Session> session);
-    void leave_room(const std::string& room_id, std::shared_ptr<Session> session, bool end_meeting = false);
-
-    void remove_room(const std::string& room_id, const std::string& reason = "empty_timeout");
-    void remove_empty_rooms();
-
-
-    net::io_context& get_io_context();
-
-private:
-    net::io_context& _ioc;
-    tcp::acceptor _acceptor;
-    std::recursive_mutex _map_mutex;
-    std::unordered_map<std::string, std::shared_ptr<Session>> _sessions;
-    std::unordered_map<std::string, Room> _rooms;
-    std::unordered_map<std::string, std::chrono::system_clock::time_point> _empty_rooms;
-    std::unique_ptr<net::steady_timer> _empty_room_timer;
-};
-
-// 3. 定义 Session 类
-class Session : public std::enable_shared_from_this<Session> {
-public:
-    Session(tcp::socket socket, std::shared_ptr<SignalingServer> server);
-
-    void start();
-
-    void send_json(const nlohmann::json& msg);
-
-    std::string get_session_id() const;
-    std::string get_self_name() const;
-    void set_self_name(const std::string& self_name);
-
-    void set_current_room(const std::string& room_id);
-    std::string get_current_room() const;
-
-
-    void start_heartbeat();
-    void schedule_heartbeat();
-    void reset_heartbeat();
-    void stop_heartbeat();
-private:
-    void on_accept(beast::error_code ec);
-
-    void do_read();
-    void on_read(beast::error_code ec, std::size_t bytes_transferred);
-    void handle_read(const nlohmann::json& data);
-    
-    void queue_write(std::string msg);
-    void do_write();
-    
-    void cleanup();
-    void close_socket(websocket::close_code code = websocket::close_code::policy_error);
-
-    websocket::stream<beast::tcp_stream> _ws;
-    beast::flat_buffer _buffer;
-    std::shared_ptr<SignalingServer> _server;
-    std::string _session_id;
-    std::string _self_name;
-    std::string _current_room;
-    std::queue<std::string> _write_queue;
-
-    net::steady_timer _heartbeat_timer;
-    std::chrono::system_clock::time_point _last_heartbeat;
-};
-
-// --- 4. 定义成员函数实现 ---
+}
+// --- 成员函数实现 ---
 
 
 // --- SignalingServer 类实现 ---
@@ -157,22 +72,48 @@ void SignalingServer::start_accept() {
     _acceptor.async_accept(net::make_strand(_ioc), 
         [this, self = shared_from_this()](beast::error_code ec, tcp::socket socket) {
             if (!ec) {
-                auto session = std::make_shared<Session>(std::move(socket), self);
-                session->start();
+                auto conn = std::make_shared<Connection>(std::move(socket));
+                auto user = std::make_shared<UserPresence>(self);
+                user->init_connection(conn);
+                conn->start();
             }
             start_accept();
         });
 }
 
-void SignalingServer::register_user(const std::string& id, const std::string& self_name, std::shared_ptr<Session> session) {
+void SignalingServer::register_user(const std::string& id, const std::string& self_name, std::shared_ptr<UserPresence> user) {
     std::lock_guard<std::recursive_mutex> lock(_map_mutex);
-    _sessions[id] = session;
-    session->set_self_name(self_name.empty() ? id : self_name);
-    session->send_json({{"type", "register_success"}, {"session_id", id}, {"self_name", session->get_self_name()}});
+
+    RedisManager& redis = RedisManager::getInstance();
+    auto old_token_it = _user_reconnect_tokens.find(id);
+    if (old_token_it != _user_reconnect_tokens.end()) {
+        redis.del("reconnect:" + old_token_it->second);
+    }
+
+    const std::string reconnect_token = generate_reconnect_token();
+    if (!redis.set("reconnect:" + reconnect_token, id)) {
+        user->send_json({{"type", "error"}, {"message", "Failed to create reconnect token"}});
+        return;
+    }
+
+    _user_reconnect_tokens[id] = reconnect_token;
+    _sessions[id] = user;
+    user->set_self_name(self_name.empty() ? id : self_name);
+    user->send_json({
+        {"type", "register_success"},
+        {"session_id", id},
+        {"self_name", user->get_self_name()},
+        {"reconnect_token", reconnect_token}
+    });
 }
 
 void SignalingServer::remove_user(const std::string& id) {
     std::lock_guard<std::recursive_mutex> lock(_map_mutex);
+    auto token_it = _user_reconnect_tokens.find(id);
+    if (token_it != _user_reconnect_tokens.end()) {
+        RedisManager::getInstance().del("reconnect:" + token_it->second);
+        _user_reconnect_tokens.erase(token_it);
+    }
     _sessions.erase(id);
 }
 
@@ -184,35 +125,29 @@ void SignalingServer::deliver(const std::string& target_id, const nlohmann::json
     }
 }
 
-void SignalingServer::broadcast(const std::string& room_id, const nlohmann::json& msg, std::shared_ptr<Session> exclude_session) {
+void SignalingServer::broadcast(const std::string& room_id, const nlohmann::json& msg, std::shared_ptr<UserPresence> exclude_user) {
+    const std::vector<std::string> session_ids = RoomManager::getInstance().getSessionIds(room_id);
+    const std::string exclude_user_id = exclude_user ? exclude_user->get_user_id() : "";
+
     std::lock_guard<std::recursive_mutex> lock(_map_mutex);
-    auto room_it = _rooms.find(room_id);
-    if (room_it != _rooms.end()) {
-        for (auto& session : room_it->second.current_sessions) {
-            if (session != exclude_session) {
-                session->send_json(msg);
-            }
+    for (const auto& user_id : session_ids) {
+        if (!exclude_user_id.empty() && user_id == exclude_user_id) {
+            continue;
+        }
+        auto it = _sessions.find(user_id);
+        if (it != _sessions.end()) {
+            it->second->send_json(msg);
         }
     }
 }
 
-std::string Session::get_session_id() const {
-    return _session_id;
-}
 
-std::string Session::get_self_name() const {
-    return _self_name.empty() ? _session_id : _self_name;
-}
 
-void Session::set_self_name(const std::string& self_name) {
-    _self_name = self_name;
-}
-
-void SignalingServer::create_room(const std::string& room_id, std::shared_ptr<Session> session,
+void SignalingServer::create_room(const std::string& room_id, std::shared_ptr<UserPresence> user,
                                   std::chrono::system_clock::time_point start_time,
                                   const std::string& meeting_type) {
     if(room_id.empty()) {
-        session->send_json({{"type", "error"}, {"message", "Room ID cannot be empty"}});
+        user->send_json({{"type", "error"}, {"message", "Room ID cannot be empty"}});
         std::cerr << "Failed to create room: Room ID cannot be empty" << std::endl;
         return;
     }
@@ -224,29 +159,18 @@ void SignalingServer::create_room(const std::string& room_id, std::shared_ptr<Se
         normalized_type = "quick";
     }
 
-    std::lock_guard<std::recursive_mutex> lock(_map_mutex);
-    if(_rooms.find(room_id) == _rooms.end()) {
-        Room room(room_id, start_time);
-        room.room_id = room_id;
-        room.meeting_type = normalized_type;
-        room.host_id = session->get_session_id();
-        room.current_sessions.insert(session);
-        if (!room.host_id.empty()) {
-            room.participants.insert(room.host_id);
-        }
-        _rooms.emplace(room_id, std::move(room));
-        session->set_current_room(room_id);
+    if (RoomManager::getInstance().createRoom(room_id, user->get_user_id(), start_time, normalized_type)) {
+        user->set_current_room(room_id);
         std::cout << "Room Created: " << room_id << std::endl;
-        session->send_json({
+        user->send_json({
             {"type", "create_room_success"},
             {"room_id", room_id},
             {"is_host", true},
-            {"host_id", session->get_session_id()},
-            {"meeting_type", room.meeting_type}
+            {"host_id", user->get_user_id()},
+            {"meeting_type", normalized_type}
         });
-    }
-    else{
-        session->send_json({{"type", "error"}, {"message", "Room already exists"}});
+    } else {
+        user->send_json({{"type", "error"}, {"message", "Room already exists"}});
         std::cerr << "Room already exists: " << room_id << std::endl;
     }
 }
@@ -257,332 +181,92 @@ void SignalingServer::create_reserved_room(const std::string& room_id, const std
         return;
     }
 
-    std::lock_guard<std::recursive_mutex> lock(_map_mutex);
-    auto room_it = _rooms.find(room_id);
-    if (room_it == _rooms.end()) {
-        Room room(room_id, start_time);
-        room.meeting_type = "reserved";
-        room.host_id = host_id;
-        if (!host_id.empty()) {
-            room.participants.insert(host_id);
-        }
-        _rooms.emplace(room_id, std::move(room));
+    const bool existed = RoomManager::getInstance().getRoomCopy(room_id).has_value();
+    RoomManager::getInstance().createOrUpdateReservedRoom(room_id, host_id, start_time);
+    if (!existed) {
         std::cout << "Reserved room prepared: " << room_id << std::endl;
-        return;
-    }
-
-    room_it->second.start_time = start_time;
-    room_it->second.meeting_type = "reserved";
-    if (!host_id.empty()) {
-        room_it->second.host_id = host_id;
-        room_it->second.participants.insert(host_id);
     }
 }
 
-void SignalingServer::join_room(const std::string& room_id, std::shared_ptr<Session> session) {
-    std::lock_guard<std::recursive_mutex> lock(_map_mutex);
-    auto room_it = _rooms.find(room_id);
-    if(room_it != _rooms.end() && room_it->second.current_sessions.find(session) == room_it->second.current_sessions.end()) {
-        if(room_it->second.start_time>std::chrono::system_clock::now()) {
-            session->send_json({{"type", "error"}, {"message", "Cannot join room before start time"}});
-            std::cerr << "User " << session->get_session_id() << " cannot join room " << room_id << " before start time" << std::endl;
+void SignalingServer::join_room(const std::string& room_id, std::shared_ptr<UserPresence> user) {
+    const JoinRoomResult join_result = RoomManager::getInstance().addSession(room_id, user->get_user_id());
+    if (join_result == JoinRoomResult::kOk) {
+        auto room_opt = RoomManager::getInstance().getRoomCopy(room_id);
+        if (!room_opt.has_value()) {
+            user->send_json({{"type", "error"}, {"message", "Room state changed, retry join"}});
             return;
         }
-        room_it->second.current_sessions.insert(session);
-        if (!session->get_session_id().empty()) {
-            room_it->second.participants.insert(session->get_session_id());
-        }
-        session->set_current_room(room_id);
-        if(_empty_rooms.find(room_id) != _empty_rooms.end()) {
-            room_it->second.empty_time = std::chrono::system_clock::time_point(); // 重置变空时间
-            _empty_rooms.erase(room_id);
-        }
-        const bool joined_is_host = (!session->get_session_id().empty() && session->get_session_id() == room_it->second.host_id);
+
+        const Room room = room_opt.value();
+        user->set_current_room(room_id);
+        const bool joined_is_host = (!user->get_user_id().empty() && user->get_user_id() == room.host_id);
         broadcast(room_id, {
             {"type", "user_joined"},
-            {"session_id", session->get_session_id()},
-            {"from", session->get_session_id()},
-            {"from_name", session->get_self_name()}
-        }, session);
-        session->send_json({
+            {"session_id", user->get_user_id()},
+            {"from", user->get_user_id()},
+            {"from_name", user->get_self_name()}
+        }, user);
+        user->send_json({
             {"type", "join_room_success"},
             {"room_id", room_id},
             {"is_host", joined_is_host},
-            {"host_id", room_it->second.host_id},
-            {"meeting_type", room_it->second.meeting_type}
+            {"host_id", room.host_id},
+            {"meeting_type", room.meeting_type}
         });
-        std::cout << "User " << session->get_session_id() << " joined room " << room_id << std::endl;
-    }
-    else if(room_it == _rooms.end()) {
-        session->send_json({{"type", "error"}, {"message", "Room does not exist"}});
-        std::cout << "User " << session->get_session_id() << " failed to join non-existent room " << room_id << std::endl;
-    }
-    else if(room_it->second.current_sessions.find(session) != room_it->second.current_sessions.end()) {
-        session->send_json({{"type", "error"}, {"message", "Already in the room"}});
-        std::cout << "User " << session->get_session_id() << " is already in room " << room_id << std::endl;
-    }
-    else{
-        session->send_json({{"type", "error"}, {"message", "Unknown error joining room"}});
-        std::cerr << "Unknown error: User " << session->get_session_id() << " failed to join room " << room_id << std::endl;
-    }
-}
-
-void SignalingServer::leave_room(const std::string& room_id, std::shared_ptr<Session> session, bool end_meeting) {
-    std::lock_guard<std::recursive_mutex> lock(_map_mutex);
-    auto room_it = _rooms.find(room_id);
-    if (room_it != _rooms.end()) {
-        const std::string leaving_id = session->get_session_id();
-        const bool host_left = !leaving_id.empty() && leaving_id == room_it->second.host_id;
-
-        room_it->second.current_sessions.erase(session);
-
-        if (host_left && end_meeting) {
-            remove_room(room_id, "host_end");
-            return;
-        }
-
-        //todo: 可以考虑如果房主离开但会议未结束，自动转移房主身份给其他参与者
-        // if (host_left && !room_it->second.current_sessions.empty()) {
-        //     std::string new_host;
-        //     for (const auto& sess : room_it->second.current_sessions) {
-        //         const std::string candidate = sess->get_session_id();
-        //         if (!candidate.empty()) {
-        //             new_host = candidate;
-        //             break;
-        //         }
-        //     }
-        //     room_it->second.host_id = new_host;
-        // }
-
-        if (!room_it->second.current_sessions.empty()) {
-            broadcast(room_id, {{"type", "user_left"}, {"session_id", leaving_id}}, session);
-        }
-        else{
-            room_it->second.empty_time = std::chrono::system_clock::now();
-            _empty_rooms[room_id] = room_it->second.empty_time;
-            std::cout << "Room " << room_id << " marked as empty." << std::endl;
-        }
+        std::cout << "User " << user->get_user_id() << " joined room " << room_id << std::endl;
+    } else if (join_result == JoinRoomResult::kRoomNotFound) {
+        user->send_json({{"type", "error"}, {"message", "Room does not exist"}});
+        std::cout << "User " << user->get_user_id() << " failed to join non-existent room " << room_id << std::endl;
+    } else if (join_result == JoinRoomResult::kBeforeStartTime) {
+        user->send_json({{"type", "error"}, {"message", "Cannot join room before start time"}});
+        std::cerr << "User " << user->get_user_id() << " cannot join room " << room_id << " before start time" << std::endl;
+    } else if (join_result == JoinRoomResult::kAlreadyInRoom) {
+        user->send_json({{"type", "error"}, {"message", "Already in the room"}});
+        std::cout << "User " << user->get_user_id() << " is already in room " << room_id << std::endl;
+    } else {struct Room {
+    std::string room_id;
+    std::string meeting_type; // quick | reserved | screen_share
+    std::set<std::string> participants; // 存储用户ID
+    std::set<std::shared_ptr<UserPresence>> current_sessions; // 存储用户的UserPresence对象
+    std::string host_id; // 房主ID
+    std::chrono::system_clock::time_point start_time; // 预约时间
+    std::chrono::system_clock::time_point empty_time; // 变空的时间点
+    Room(std::string room_id_, std::chrono::system_clock::time_point start_time_ = std::chrono::system_clock::now())
+        : room_id(std::move(room_id_)), meeting_type("quick"), start_time(start_time_) {}
+};
+        user->send_json({{"type", "error"}, {"message", "Unknown error joining room"}});
+        std::cerr << "Unknown error: User " << user->get_user_id() << " failed to join room " << room_id << std::endl;
     }
 }
 
-// --- Session 类实现 ---
-Session::Session(tcp::socket socket, std::shared_ptr<SignalingServer> server)
-    : _ws(std::move(socket)), _server(server), _heartbeat_timer(_ws.get_executor()) {}
-
-void Session::start() {
-    _ws.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
-    _ws.async_accept(beast::bind_front_handler(&Session::on_accept, shared_from_this()));
-}
-
-void Session::send_json(const nlohmann::json& msg) {
-    std::string msg_str = msg.dump();
-    net::post(_ws.get_executor(), [self = shared_from_this(), msg_str]() {
-        self->queue_write(std::move(msg_str));
-    });
-}
-
-void Session::set_current_room(const std::string& room_id) {
-    _current_room = room_id;
-}
-
-std::string Session::get_current_room() const {
-    return _current_room;
-}
-
-void Session::on_accept(beast::error_code ec) {
-    if (ec) return;
-    do_read();
-}
-
-void Session::do_read() {
-    _ws.async_read(_buffer, beast::bind_front_handler(&Session::on_read, shared_from_this()));
-}
-
-void Session::queue_write(std::string msg) {
-    bool write_in_progress = !_write_queue.empty();
-    _write_queue.push(std::move(msg));
-    if (!write_in_progress) {
-        do_write();
-    }
-}
-
-void Session::do_write() {
-    if (_write_queue.empty()) return;
-
-    _ws.async_write(net::buffer(_write_queue.front()), 
-        [self = shared_from_this()](beast::error_code ec, std::size_t) {
-            if (ec) {
-                self->cleanup();
-                return;
-            }
-            self->_write_queue.pop();
-            if (!self->_write_queue.empty()) {
-                self->do_write();
-            }
-        });
-}
-
-
-void Session::on_read(beast::error_code ec, std::size_t bytes_transferred) {
-    if (ec == websocket::error::closed) { cleanup(); return; }
-    if (ec) { cleanup(); return; }
-
-    try {
-        std::string msg = beast::buffers_to_string(_buffer.data());
-        handle_read(nlohmann::json::parse(msg));
-    } catch (std::exception& e) {
-        std::cerr << "JSON parse error: " << e.what() << std::endl;
-    }
-
-    _buffer.consume(bytes_transferred);
-    do_read();
-}
-
-void Session::close_socket(websocket::close_code code) {
-    beast::error_code close_ec;
-    _ws.close(code, close_ec);
-    if (close_ec && close_ec != websocket::error::closed) {
-        std::cerr << "WebSocket close error: " << close_ec.message() << std::endl;
-    }
-}
-
-void Session::handle_read(const nlohmann::json& data) {
-
-    // std::cout << "[Debug] Received JSON: " << data.dump() << std::endl;
-
-
-    std::string type = data.value("type", "unknown");
-    std::string token = data.value("access_token", data.value("token", ""));
-    if (token.empty()) {
-        std::cerr << "Missing token in message" << std::endl;
-        send_json({{"type", "error"}, {"message", "Missing token"}});
-        cleanup();
-        close_socket();
-        return;
-    }
-    
-    RedisManager& redis = RedisManager::getInstance();
-    std::string token_id;
-    bool access_hit = redis.get("access:" + token, token_id) && !token_id.empty();
-
-    if(!access_hit) {
-        std::cerr << "Invalid or expired token: " << token << std::endl;
-        send_json({{"type", "error"}, {"message", "Invalid or expired token"}});
-        cleanup();
-        close_socket();
-        return;
-    }
-    if(!_session_id.empty() && _session_id != token_id) {
-        std::cerr << "Token does not match session_id: " << token_id << " vs " << _session_id << std::endl;
-        send_json({{"type", "error"}, {"message", "Token does not match session_id"}});
-        cleanup();
-        close_socket();
-        return;
-    }
-    if(type != "register" && _session_id.empty()) {
-        std::cerr << "Unauthenticated message type before register: " << type << std::endl;
-        send_json({{"type", "error"}, {"message", "Must register before sending business messages"}});
-        cleanup();
-        close_socket();
+void SignalingServer::leave_room(const std::string& room_id, std::shared_ptr<UserPresence> user, bool end_meeting) {
+    auto room_opt = RoomManager::getInstance().getRoomCopy(room_id);
+    if (!room_opt.has_value()) {
         return;
     }
 
-    if (type == "register") {
-        if(token_id == data.value("session_id", "")) {
-            _session_id = token_id;
-            const std::string self_name = data.value("self_name", _session_id);
-            _self_name = self_name.empty() ? _session_id : self_name;
-            _server->register_user(_session_id, _self_name, shared_from_this());
-            std::cout << "User Registered: " << _session_id << std::endl;   
+    const std::string leaving_id = user->get_user_id();
+    const bool host_left = !leaving_id.empty() && leaving_id == room_opt->host_id;
 
-            start_heartbeat();
-        }
-        else{
-            std::cerr << "Token does not match session_id: " << token_id << " vs " << data.value("session_id", "") << std::endl;
-            send_json({{"type", "error"}, {"message", "Token does not match session_id"}});
-            cleanup();
-            close_socket();
-            return;
-        }
-    } else if (type == "offer" || type == "answer" || type == "candidate") {
-        std::string to = data.value("to", "");
-        _server->deliver(to, data);
+    bool became_empty = false;
+    if (!RoomManager::getInstance().removeSession(room_id, leaving_id, &became_empty)) {
+        return;
     }
-    else if (type == "join") {
-        std::string room = data.value("room", "");
-        _server->join_room(room, shared_from_this());
+
+    user->set_current_room("");
+
+    if (host_left && end_meeting) {
+        remove_room(room_id, "host_end");
+        return;
     }
-    else if (type == "leave") {
-        std::string room = data.value("room", "");
-        const bool end_meeting = data.value("end_meeting", false);
-        _server->leave_room(room, shared_from_this(), end_meeting);
-    }
-    else if (type == "create") {
-        std::string room = data.value("room", "");
-        std::string meeting_type = data.value("meeting_type", "quick");
-        _server->create_room(room, shared_from_this(), std::chrono::system_clock::now(), meeting_type);
-    }
-    else if (type == "media_state") {
-        std::string room = data.value("room", "");
-        _server->broadcast(room, data, shared_from_this());
-    }
-    else if (type == "chat") {
-        std::string room = data.value("room", "");
-        _server->broadcast(room, data, shared_from_this());
-    }
-    else if (type == "pong") {
-        reset_heartbeat();
-    }
-    else{
-        std::cerr << "Unknown message type: " << type << std::endl;
-        std::cerr << "Full message: " << data.dump() << std::endl;
+
+    if (!became_empty) {
+        broadcast(room_id, {{"type", "user_left"}, {"session_id", leaving_id}}, user);
+    } else {
+        std::cout << "Room " << room_id << " marked as empty." << std::endl;
     }
 }
 
-void Session::cleanup() {
-    if (!_session_id.empty()) {
-        _server->remove_user(_session_id);
-    }
-    if(!_current_room.empty()) {
-        _server->leave_room(_current_room, shared_from_this(), false);
-    }
-    std::cout << "User Offline: " << _session_id << std::endl;
-}
-
-void Session::start_heartbeat() {
-    _last_heartbeat = std::chrono::system_clock::now();
-    schedule_heartbeat();
-}
-
-void Session::schedule_heartbeat() {
-    _heartbeat_timer.expires_after(std::chrono::seconds(30));
-    _heartbeat_timer.async_wait([self = shared_from_this()](const boost::system::error_code& ec) {
-        if (ec) {
-            return;
-        }
-        if(std::chrono::system_clock::now() - self->_last_heartbeat > std::chrono::seconds(40)) {
-            std::cerr << "Heartbeat timeout for session " << self->_session_id << std::endl;
-            self->cleanup();
-            self->close_socket();
-            return;
-        }
-
-        self->send_json({{"type", "ping"}});
-        self->schedule_heartbeat();
-    });
-}
-
-void Session::reset_heartbeat() {
-    _last_heartbeat = std::chrono::system_clock::now();
-}
-
-void Session::stop_heartbeat() {
-    boost::system::error_code ec;
-    _heartbeat_timer.cancel(ec);
-    if (ec) {
-        std::cerr << "Error stopping heartbeat timer: " << ec.message() << std::endl;
-    }
-}
 
 void start_reservation_subscription(const std::shared_ptr<SignalingServer>& server) {
     std::thread([server]() {
@@ -632,28 +316,23 @@ void start_reservation_subscription(const std::shared_ptr<SignalingServer>& serv
 }
 
 void SignalingServer::remove_room(const std::string& room_id, const std::string& reason) {
-    std::lock_guard<std::recursive_mutex> lock(_map_mutex);
-    auto room_it = _rooms.find(room_id);
-    if (room_it == _rooms.end()) {
+    Room room_snapshot("", std::chrono::system_clock::now());
+    if (!RoomManager::getInstance().removeRoom(room_id, &room_snapshot)) {
         return;
     }
 
-    const Room room_snapshot = room_it->second;
-
-    for(auto session_id: room_snapshot.participants) {
-        if(_sessions.find(session_id) != _sessions.end()) {
-            _sessions[session_id]->set_current_room("");
-            _sessions[session_id]->send_json({
+    std::lock_guard<std::recursive_mutex> lock(_map_mutex);
+    for (const auto& session_id : room_snapshot.participants) {
+        auto it = _sessions.find(session_id);
+        if (it != _sessions.end()) {
+            it->second->set_current_room("");
+            it->second->send_json({
                 {"type", "room_closed"},
                 {"room_id", room_snapshot.room_id},
                 {"reason", reason},
                 {"meeting_type", room_snapshot.meeting_type}
             });
         }
-    }
-    _rooms.erase(room_snapshot.room_id);
-    if(_empty_rooms.find(room_snapshot.room_id) != _empty_rooms.end()) {
-        _empty_rooms.erase(room_snapshot.room_id);
     }
 
     RedisManager& redis_mgr = RedisManager::getInstance();
@@ -679,16 +358,7 @@ void SignalingServer::remove_empty_rooms() {
             return;
         }
 
-        std::vector<std::string> expired_room_ids;
-        {
-            std::lock_guard<std::recursive_mutex> lock(server->_map_mutex);
-            const auto now = std::chrono::system_clock::now();
-            for (const auto& [room_id, empty_time] : server->_empty_rooms) {
-                if (now - empty_time > std::chrono::minutes(15)) {
-                    expired_room_ids.push_back(room_id);
-                }
-            }
-        }
+        const std::vector<std::string> expired_room_ids = RoomManager::getInstance().listExpiredEmptyRooms(std::chrono::minutes(15));
 
         for (const auto& room_id : expired_room_ids) {
             server->remove_room(room_id, "empty_timeout");
@@ -699,6 +369,51 @@ void SignalingServer::remove_empty_rooms() {
     });
 }
 
+void SignalingServer::reconnect_user(const std::string& reconnect_token, std::shared_ptr<UserPresence> user, std::shared_ptr<Connection> new_conn) {
+    if (!new_conn) {
+        return;
+    }
+
+    RedisManager& redis = RedisManager::getInstance();
+    std::string user_id;
+    bool hit = redis.get("reconnect:" + reconnect_token, user_id) && !user_id.empty();
+
+    if (!hit) {
+        new_conn->send_json({{"type", "error"}, {"message", "Invalid or expired reconnect token"}});
+        new_conn->close_socket();
+        return;
+    }
+
+    // 根据token查找旧用户ID，将新连接绑定到旧用户，并清理该新用户
+    {
+        std::lock_guard<std::recursive_mutex> lock(_map_mutex);
+        auto it = _sessions.find(user_id);
+        if (it == _sessions.end()) {
+            new_conn->send_json({{"type", "error"}, {"message", "Reconnect target user is offline"}});
+            new_conn->close_socket();
+            return;
+        }
+
+        auto old_user = it->second;
+        auto old_conn = old_user->get_connection();
+        if (old_conn) {
+            old_conn->close_socket();
+        }
+        old_user->init_connection(new_conn);
+        old_user->on_connection_recovered();
+        old_user->send_json({
+            {"type", "reconnect_success"},
+            {"session_id", user_id},
+            {"self_name", old_user->get_self_name()},
+            {"current_room", old_user->get_current_room()}
+        });
+
+        if (user && user != old_user) {
+            user->cleanup();
+        }
+    }
+
+}
 
 // --- 5. 主函数 ---
 int main() {

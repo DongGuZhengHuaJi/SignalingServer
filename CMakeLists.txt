@@ -31,6 +31,8 @@ find_package(Threads REQUIRED)
 # 2. 创建目标
 add_executable(signaling_server                 
     signaling_server.cpp
+    connection.cpp
+    user_presence.cpp
     thread_pool.hpp
     redis_mgr.h
 )
