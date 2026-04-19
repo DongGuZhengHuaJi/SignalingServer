@@ -8,7 +8,6 @@
 #include <chrono>
 #include <vector>
 #include <set>
-#include <queue>
 #include <mutex>
 #include <unordered_map>
 #include <random>
@@ -24,7 +23,6 @@
 
 namespace net = boost::asio;
 namespace beast = boost::beast;
-namespace websocket = beast::websocket;
 using tcp = net::ip::tcp;
 
 namespace {
@@ -109,11 +107,8 @@ void SignalingServer::register_user(const std::string& id, const std::string& se
 
 void SignalingServer::remove_user(const std::string& id) {
     std::lock_guard<std::recursive_mutex> lock(_map_mutex);
-    auto token_it = _user_reconnect_tokens.find(id);
-    if (token_it != _user_reconnect_tokens.end()) {
-        RedisManager::getInstance().del("reconnect:" + token_it->second);
-        _user_reconnect_tokens.erase(token_it);
-    }
+    // 保留 reconnect_token：允许 session 被清理后仍可使用 reconnect 恢复。
+    // token 会在下次 register_user 时被旋转并覆盖。
     _sessions.erase(id);
 }
 
@@ -389,8 +384,25 @@ void SignalingServer::reconnect_user(const std::string& reconnect_token, std::sh
         std::lock_guard<std::recursive_mutex> lock(_map_mutex);
         auto it = _sessions.find(user_id);
         if (it == _sessions.end()) {
-            new_conn->send_json({{"type", "error"}, {"message", "Reconnect target user is offline"}});
-            new_conn->close_socket();
+            // 旧 session 不在内存中时，仍允许基于 reconnect_token 恢复会话。
+            if (!user) {
+                new_conn->send_json({{"type", "error"}, {"message", "Reconnect target user is unavailable"}});
+                new_conn->close_socket();
+                return;
+            }
+
+            user->set_user_id(user_id);
+            user->set_self_name(user_id);
+            _sessions[user_id] = user;
+            _user_reconnect_tokens[user_id] = reconnect_token;
+
+            user->on_connection_recovered();
+            user->send_json({
+                {"type", "reconnect_success"},
+                {"session_id", user_id},
+                {"self_name", user->get_self_name()},
+                {"current_room", user->get_current_room()}
+            });
             return;
         }
 

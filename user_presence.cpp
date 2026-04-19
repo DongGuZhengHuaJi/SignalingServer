@@ -68,6 +68,18 @@ void UserPresence::handle_message(const nlohmann::json& data) {
     }
 
     std::string type = data.value("type", "unknown");
+
+    // 心跳包单独处理：允许无 access_token，且支持双向 ping/pong。
+    if (type == "ping") {
+        reset_heartbeat();
+        send_json({{"type", "pong"}});
+        return;
+    }
+    if (type == "pong") {
+        reset_heartbeat();
+        return;
+    }
+
     std::string token = data.value("access_token", data.value("token", ""));
     
     if (token.empty()) {
@@ -177,9 +189,6 @@ void UserPresence::handle_message(const nlohmann::json& data) {
     else if (type == "chat") {
         std::string room = data.value("room", "");
         _server->broadcast(room, data, shared_from_this());
-    }
-    else if (type == "pong") {
-        reset_heartbeat();
     }
     else{
         std::cerr << "Unknown message type: " << type << std::endl;
