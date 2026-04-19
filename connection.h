@@ -6,6 +6,8 @@
 #include <queue>
 #include <functional>
 #include <nlohmann/json.hpp>
+#include <atomic>
+#include <boost/beast/core.hpp>
 
 namespace net = boost::asio;
 namespace beast = boost::beast;
@@ -43,7 +45,7 @@ public:
     void bind_user(std::shared_ptr<UserPresence> user);
     std::shared_ptr<UserPresence> get_bind_user() const;
 
-    
+    auto get_executor() { return _ws.get_executor(); }
 
 private:
     void on_accept(beast::error_code ec);
@@ -53,4 +55,6 @@ private:
     std::queue<std::string> _write_queue;
     std::weak_ptr<UserPresence> _bind_user; // 绑定的用户对象，避免循环引用
     MessageCallback _message_callback;
+
+    std::atomic<bool> _is_closing{false};
 };

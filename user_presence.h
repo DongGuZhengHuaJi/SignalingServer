@@ -22,6 +22,7 @@ public:
 
     // 初始化连接
     void init_connection(std::shared_ptr<Connection> connection);
+    void set_connection(std::shared_ptr<Connection> connection);
 
     // 用户ID和名称管理
     const std::string& get_user_id() const;

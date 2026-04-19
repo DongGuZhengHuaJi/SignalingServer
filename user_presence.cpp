@@ -61,6 +61,10 @@ std::shared_ptr<Connection> UserPresence::get_connection() const {
     return _connection.lock();
 }
 
+void UserPresence::set_connection(std::shared_ptr<Connection> connection) {
+    _connection = connection;
+}
+
 void UserPresence::handle_message(const nlohmann::json& data) {
     if (!_server) {
         std::cerr << "Error: SignalingServer is not set" << std::endl;
@@ -212,24 +216,34 @@ void UserPresence::start_heartbeat() {
 }
 
 void UserPresence::schedule_heartbeat() {
+    auto conn = _connection.lock();
+    if (!conn) return;
     _heartbeat_timer.expires_after(std::chrono::seconds(30));
-    _heartbeat_timer.async_wait([self = shared_from_this()](const boost::system::error_code& ec) {
+    _heartbeat_timer.async_wait(net::bind_executor(conn->get_executor(),[self = shared_from_this()](const boost::system::error_code& ec) {
         if (ec) {
             return;
         }
         if(std::chrono::system_clock::now() - self->_last_heartbeat > std::chrono::seconds(40)) {
             std::cerr << "Heartbeat timeout for user " << self->_user_id << std::endl;
-            self->cleanup();
+            
+            // 修复：停止心跳，手动触发掉线保护，而不是直接 cleanup()
+            self->stop_heartbeat();
             auto conn = self->_connection.lock();
             if (conn) {
+                // 主动关闭 socket，这可能也会触发 on_read 报错，
+                // 但我们在 on_connection_lost 里有防重入机制，所以安全。
+                self->on_connection_lost(conn); 
                 conn->close_socket();
+            } else {
+                // 如果连 connection 都没了，那才是彻底凉了
+                self->cleanup();
             }
             return;
         }
 
         self->send_json({{"type", "ping"}});
         self->schedule_heartbeat();
-    });
+    }));
 }
 
 void UserPresence::reset_heartbeat() {
@@ -254,7 +268,7 @@ void UserPresence::on_connection_lost(std::shared_ptr<Connection> conn) {
     _status = UserStatus::RECONNECTING;
     std::cout << "Connection lost for user " << _user_id << ", waiting for reconnection..." << std::endl;
 
-    _hover_timer.expires_after(std::chrono::seconds(30));
+    _hover_timer.expires_after(std::chrono::seconds(60));
     _hover_timer.async_wait([self = weak_from_this()](beast::error_code ec) {
         if (ec) return;  // 被取消（重连成功）
         if (auto s = self.lock()) {

@@ -24,39 +24,52 @@ void Connection::do_read() {
 }
 
 void Connection::on_read(beast::error_code ec, std::size_t bytes_transferred) {
-    if (ec == websocket::error::closed) { 
+    // 1. 核心防御：如果是操作被取消（例如我们主动关闭了 Socket），直接返回
+    // 这样可以防止在关闭过程中，残留的 read 回调再次触发 cleanup 逻辑
+    if (ec == boost::asio::error::operation_aborted) {
+        return;
+    }
+
+    // 2. 处理错误（包括对端正常关闭 ec == websocket::error::closed 或其他网络错误）
+    if (ec) {
+        // 如果是正常关闭，不打印 error 日志，如果是异常错误则打印
+        if (ec != websocket::error::closed) {
+            std::cerr << "WebSocket read error: " << ec.message() << std::endl;
+        }
+
         auto user = _bind_user.lock();
         if (user) {
-            // user->cleanup();
+            // 停止心跳定时器
             user->stop_heartbeat();
+            
+            // 安全关闭：这里会进入我们修改过的 close_socket
+            // 内部的 std::atomic<bool> _is_closing 会保证只有第一次调用生效
             this->close_socket();
-            user->on_connection_lost(shared_from_this());
 
+            // 通知用户管理器：连接已丢失，进入 30s 重连等待期（hover timer）
+            user->on_connection_lost(shared_from_this());
         }
         return; 
     }
-    if (ec) { 
-        std::cerr << "WebSocket read error: " << ec.message() << std::endl;
-        auto user = _bind_user.lock();
-        if (user) {
-            // user->cleanup();
-            user->stop_heartbeat();
-            this->close_socket();
-            user->on_connection_lost(shared_from_this());
-        }
-        return; 
-    }
 
+    // 3. 正常处理接收到的消息
     try {
+        // 将 buffer 数据转为字符串
         std::string msg = beast::buffers_to_string(_buffer.data());
+        
+        // 必须在回调执行前消耗掉 buffer，否则下次 read 会重叠
+        _buffer.consume(bytes_transferred);
+
         if (_message_callback) {
             _message_callback(msg);
         }
-    } catch (std::exception& e) {
+    } catch (const std::exception& e) {
         std::cerr << "Message processing error: " << e.what() << std::endl;
+        // 如果处理单条消息崩溃，通常建议消耗掉该条数据并继续读取
+        _buffer.consume(_buffer.size()); 
     }
 
-    _buffer.consume(bytes_transferred);
+    // 4. 继续监听下一条消息
     do_read();
 }
 
@@ -73,13 +86,14 @@ void Connection::do_write() {
 
     _ws.async_write(net::buffer(_write_queue.front()), 
         [self = shared_from_this()](beast::error_code ec, std::size_t) {
+            if (ec == boost::asio::error::operation_aborted) return; // 拦截取消操作
+
             if (ec) {
                 std::cerr << "WebSocket write error: " << ec.message() << std::endl;
                 auto user = self->_bind_user.lock();
                 if (user) {
-                    // user->cleanup();
                     user->stop_heartbeat();
-                    self->close_socket();
+                    self->close_socket(); // 再次利用原子锁保护
                     user->on_connection_lost(self);
                 }
                 return;
@@ -99,11 +113,21 @@ void Connection::send_json(const nlohmann::json& msg) {
 }
 
 void Connection::close_socket(websocket::close_code code) {
-    beast::error_code close_ec;
-    _ws.close(code, close_ec);
-    if (close_ec && close_ec != websocket::error::closed) {
-        std::cerr << "WebSocket close error: " << close_ec.message() << std::endl;
+    if (_is_closing.exchange(true)) return; 
+
+    beast::error_code ec;
+    // 1. 先尝试优雅关闭 WebSocket
+    _ws.close(code, ec);
+
+    // 2. 强制关闭底层 TCP Socket (这是解决重连卡死的关键)
+    auto& socket = beast::get_lowest_layer(_ws).socket();
+    if (socket.is_open()) {
+        socket.shutdown(tcp::socket::shutdown_both, ec);
+        socket.close(ec);
     }
+    
+    // 3. 释放用户绑定，防止回调再次进入 UserPresence
+    _bind_user.reset();
 }
 
 void Connection::set_message_callback(MessageCallback cb) {

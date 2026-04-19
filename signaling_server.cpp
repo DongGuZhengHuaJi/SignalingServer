@@ -364,67 +364,98 @@ void SignalingServer::remove_empty_rooms() {
     });
 }
 
-void SignalingServer::reconnect_user(const std::string& reconnect_token, std::shared_ptr<UserPresence> user, std::shared_ptr<Connection> new_conn) {
+void SignalingServer::reconnect_user(const std::string& reconnect_token, 
+                                    std::shared_ptr<UserPresence> temp_user, 
+                                    std::shared_ptr<Connection> new_conn) {
     if (!new_conn) {
+        std::cerr << "Reconnect failed: new_conn is null" << std::endl;
         return;
     }
 
+    // 1. 从 Redis 验证 Token 并获取真正的 UserID
     RedisManager& redis = RedisManager::getInstance();
     std::string user_id;
     bool hit = redis.get("reconnect:" + reconnect_token, user_id) && !user_id.empty();
 
     if (!hit) {
+        std::cerr << "Reconnect rejected: Invalid or expired token: " << reconnect_token << std::endl;
         new_conn->send_json({{"type", "error"}, {"message", "Invalid or expired reconnect token"}});
+        // 这里直接关闭新 Socket
         new_conn->close_socket();
         return;
     }
 
-    // 根据token查找旧用户ID，将新连接绑定到旧用户，并清理该新用户
-    {
-        std::lock_guard<std::recursive_mutex> lock(_map_mutex);
-        auto it = _sessions.find(user_id);
-        if (it == _sessions.end()) {
-            // 旧 session 不在内存中时，仍允许基于 reconnect_token 恢复会话。
-            if (!user) {
-                new_conn->send_json({{"type", "error"}, {"message", "Reconnect target user is unavailable"}});
-                new_conn->close_socket();
-                return;
-            }
+    std::lock_guard<std::recursive_mutex> lock(_map_mutex);
+    auto it = _sessions.find(user_id);
 
-            user->set_user_id(user_id);
-            user->set_self_name(user_id);
-            _sessions[user_id] = user;
-            _user_reconnect_tokens[user_id] = reconnect_token;
-
-            user->on_connection_recovered();
-            user->send_json({
-                {"type", "reconnect_success"},
-                {"session_id", user_id},
-                {"self_name", user->get_self_name()},
-                {"current_room", user->get_current_room()}
-            });
-            return;
-        }
-
+    if (it != _sessions.end()) {
+        // --- 情况 A: 内存中存在该用户的旧 Session 对象 ---
         auto old_user = it->second;
-        auto old_conn = old_user->get_connection();
-        if (old_conn) {
-            old_conn->close_socket();
+
+        std::cout << "Reconnecting: Recovering existing session for user: " << user_id << std::endl;
+
+        // 1. 【关键】解除临时对象对新连接的持有关系
+        // temp_user 是处理当前消息的临时对象，函数结束后它可能析构。
+        // 我们必须先断开它对 new_conn 的引用，否则它析构时会触发 close_socket() 导致新连接也被关掉。
+        if (temp_user) {
+            temp_user->set_connection(nullptr);
         }
+
+        // 2. 停掉旧对象上的心跳和连接
+        // 如果旧连接还在（僵尸连接），强制关闭它
+        if (auto old_conn = old_user->get_connection()) {
+            std::cout << "Closing zombie connection for user: " << user_id << std::endl;
+            old_conn->close_socket(); 
+        }
+        old_user->stop_heartbeat();
+
+        // 3. 将新连接注入到旧的 UserPresence 对象中
+        // 这会自动调用 connection->bind_user(old_user) 并重设消息回调
         old_user->init_connection(new_conn);
+
+        // 4. 恢复旧用户的状态 (取消掉线计时器, 设为 ONLINE, 启动心跳)
         old_user->on_connection_recovered();
+
+        // 5. 再次把 token 存入映射（防止 token 旋转逻辑导致的失效）
+        _user_reconnect_tokens[user_id] = reconnect_token;
+
+        // 6. 发送成功回执给客户端
         old_user->send_json({
             {"type", "reconnect_success"},
             {"session_id", user_id},
             {"self_name", old_user->get_self_name()},
-            {"current_room", old_user->get_current_room()}
+            {"current_room", old_user->get_current_room()},
+            {"reconnect_token", reconnect_token}
         });
 
-        if (user && user != old_user) {
-            user->cleanup();
-        }
-    }
+    } else {
+        // --- 情况 B: 内存中找不到旧 Session (可能服务器重启了，但 Redis 里的 Token 还在) ---
+        std::cout << "Reconnecting: Session not in memory, promoting temp_user for: " << user_id << std::endl;
 
+        if (!temp_user) {
+            new_conn->close_socket();
+            return;
+        }
+
+        // 1. 将当前的临时对象正式转正
+        temp_user->set_user_id(user_id);
+        temp_user->set_self_name(user_id); // 默认先设为 ID
+        
+        _sessions[user_id] = temp_user;
+        _user_reconnect_tokens[user_id] = reconnect_token;
+
+        // 2. 初始化状态
+        temp_user->on_connection_recovered();
+
+        // 3. 发送成功回执
+        temp_user->send_json({
+            {"type", "reconnect_success"},
+            {"session_id", user_id},
+            {"self_name", temp_user->get_self_name()},
+            {"current_room", ""}, // 内存丢了，房间状态肯定也丢了，让客户端重新 join
+            {"reconnect_token", reconnect_token}
+        });
+    }
 }
 
 // --- 5. 主函数 ---
