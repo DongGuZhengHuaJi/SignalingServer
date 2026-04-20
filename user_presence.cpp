@@ -295,7 +295,7 @@ void  UserPresence::on_connection_recovered() {
     _hover_timer.cancel();
     _status = UserStatus::ONLINE;
     std::cout << "Connection recovered for user " << _user_id << std::endl;
-    stop_heartbeat();
+    // stop_heartbeat();
     start_heartbeat();
 
     // 重连成功以后恢复用户状态，通知房间内其他用户，其他用户客户端收到消息向该用户重新发送offer等必要信息

@@ -117,13 +117,25 @@ void Connection::close_socket(websocket::close_code code) {
 
     beast::error_code ec;
     // 1. 先尝试优雅关闭 WebSocket
-    _ws.close(code, ec);
+    // _ws.close(code, ec);
 
     // 2. 强制关闭底层 TCP Socket (这是解决重连卡死的关键)
     auto& socket = beast::get_lowest_layer(_ws).socket();
     if (socket.is_open()) {
+        ec.clear();
         socket.shutdown(tcp::socket::shutdown_both, ec);
+
+        // shutdown 可能返回错误码，不能忽略（例如 socket 已半关闭或已断开）
+        if (ec && ec != boost::asio::error::not_connected) {
+            std::cerr << "Socket shutdown error: " << ec.message() << std::endl;
+        }
+
+        ec.clear();
         socket.close(ec);
+
+        if (ec) {
+            std::cerr << "Socket close error: " << ec.message() << std::endl;
+        }
     }
     
     // 3. 释放用户绑定，防止回调再次进入 UserPresence
